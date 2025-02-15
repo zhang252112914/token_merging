@@ -30,7 +30,8 @@ class RetrievalDataset(Dataset):
             video_framerate=1,
             image_resolution=224,
             mode='all',
-            config=None
+            config=None,
+            max_sentences_per_video=12
     ):
         self.subset = subset
         self.anno_path = anno_path
@@ -42,6 +43,7 @@ class RetrievalDataset(Dataset):
         self.image_resolution = image_resolution
         self.mode = mode  # all/text/vision
         self.config = config
+        self.max_sentences_per_video = max_sentences_per_video
 
         self.video_dict, self.sentences_dict = self._get_anns(self.subset)
 
@@ -140,17 +142,19 @@ class RetrievalDataset(Dataset):
         raise NotImplementedError
 
     def _get_text(self, caption):
-        if len(caption) == 3:
-            _caption_text, s, e = caption
+        if isinstance(caption, list):
+            texts, starts, ends = zip(*caption)
+            _caption_text = list(texts)
+            s = list(starts)
+            e = list(ends)
         else:
             raise NotImplementedError
+        
+        valid_text_mask = len(_caption_text) * [True] + (self.max_sentences_per_video-len(_caption_text)) * [False]
 
-        if isinstance(_caption_text, list):
-            caption_text = random.choice(_caption_text)
-        else:
-            caption_text = _caption_text
-
-        words = self.tokenizer.tokenize(caption_text)
+        words_list = []
+        for text in _caption_text:
+            words_list.append(self.tokenizer.tokenize(text))
 
         if self.subset == "train" and 0:  # 永远为假？
             if random.random() < 0.5:
@@ -160,26 +164,40 @@ class RetrievalDataset(Dataset):
                         new_words.append(words[idx])
                 words = new_words
 
-        words = [self.SPECIAL_TOKEN["CLS_TOKEN"]] + words
+        words_list = [[self.SPECIAL_TOKEN["CLS_TOKEN"]] + words for words in words_list]
         total_length_with_CLS = self.max_words - 1
-        if len(words) > total_length_with_CLS:
-            words = words[:total_length_with_CLS]
-        words = words + [self.SPECIAL_TOKEN["SEP_TOKEN"]]
+        for i in range(len(words_list)):
+            if len(words_list[i]) > total_length_with_CLS:
+                words_list[i] = words_list[i][:total_length_with_CLS]
+            words_list[i] = words_list[i] + [self.SPECIAL_TOKEN["SEP_TOKEN"]]
 
-        input_ids = self.tokenizer.convert_tokens_to_ids(words)
-        input_mask = [1] * len(input_ids)
+        input_ids = []
+        input_mask = []
 
-#         while len(input_ids) < self.max_words:
-        while len(input_ids) < self.max_words:
-            input_ids.append(0)
-            input_mask.append(0)
-        assert len(input_ids) == self.max_words
-        assert len(input_mask) == self.max_words
+        for single_words in words_list:
+            ids = self.tokenizer.convert_tokens_to_ids(single_words)
+            text_len = len(ids)
+            # 填充 input_ids
+            ids = ids + [0] * (self.max_words - text_len)
+            input_ids.append(ids)
+            # 创建对应的 mask
+            mask = [1] * text_len + [0] * (self.max_words - text_len)
+            input_mask.append(mask)
+            # 检查长度
+            assert len(ids) == self.max_words
+            assert len(mask) == self.max_words
+ 
+        input_num = len(input_ids)
+        if input_num < self.max_sentences_per_video:
+            padding = [[0] * self.max_words for _ in range(self.max_sentences_per_video - input_num)]
+            input_ids = input_ids + padding
+            input_mask = input_mask + padding
 
         input_ids = np.array(input_ids)
         input_mask = np.array(input_mask)
+        valid_text_mask = np.array(valid_text_mask)
 
-        return input_ids, input_mask, s, e
+        return input_ids, input_mask, valid_text_mask, s, e
 
     def _get_rawvideo(self, video_id, s=None, e=None):
         video_mask = np.zeros(self.max_frames, dtype=np.long)
@@ -236,7 +254,7 @@ class RetrievalDataset(Dataset):
         # T x 3 x H x W
         video = np.zeros((self.max_frames, 3, self.image_resolution, self.image_resolution), dtype=float)
 
-        if s is None:
+        if s[0] is None:
             start_time, end_time = None, None
         else:
             start_time = int(s)
@@ -305,10 +323,10 @@ class RetrievalDataset(Dataset):
 
         if self.mode == 'all':
             video_id, caption = self.sentences_dict[idx]
-            text_ids, text_mask, s, e = self._get_text(caption)
+            text_ids, text_mask, text_group_mask ,s, e = self._get_text(caption)
             video, video_mask = self._get_rawvideo_dec(video_id, s, e)
             # video, video_mask = self._get_rawvideo(video_id, s, e)
-            return text_ids, text_mask, video, video_mask, idx, hash(video_id.replace("video", ""))
+            return text_ids, text_mask, video, video_mask, idx, hash(video_id.replace("video", "")), text_group_mask
         elif self.mode == 'text':
             video_id, caption = self.sentences_dict[idx]
             text_ids, text_mask, s, e = self._get_text(caption)
