@@ -25,6 +25,47 @@ def compute_metrics(x):
     metrics["cols"] = [int(i) for i in list(ind)]
     return metrics
 
+def compute_metrics_together(sim_matrix, mask):
+    ind_gt = mask
+    ind_sort = np.argsort(np.argsort(-sim_matrix)) + 1
+    ind_mask = np.ma.array(ind_gt * ind_sort, mask=ind_gt == 0)
+    # ind_mask = ind_mask.masked_fill(ind_mask == 0, 1000000000)
+
+    ind_gt_t = ind_gt.T
+    ind_sort_t = np.argsort(np.argsort(-sim_matrix.T)) + 1
+    ind_mask_t = np.ma.array(ind_gt_t * ind_sort_t, mask=ind_gt_t == 0)
+    # ind_mask_t = ind_mask_t.masked_fill(ind_mask_t == 0, 1000000000)
+
+    rk_v2t = {}
+    rk_t2v = {}
+
+    rk_v2t['mean_mean'] = np.mean(ind_mask.mean(axis=1))
+    rk_v2t['mean_median'] = np.mean(np.ma.median(ind_mask, axis=1))
+    rk_t2v['mean_mean'] = np.mean(ind_mask_t.mean(axis=1))
+    rk_t2v['mean_median'] = np.mean(np.ma.median(ind_mask_t, axis=1))
+
+    rk_v2t['median_mean'] = np.median(ind_mask.mean(axis=1))
+    rk_v2t['median_median'] = np.median(np.ma.median(ind_mask, axis=1))
+    rk_t2v['median_mean'] = np.median(ind_mask_t.mean(axis=1))
+    rk_t2v['median_median'] = np.median(np.ma.median(ind_mask_t, axis=1))
+
+    for k in [1, 5, 10, 50, 100]:
+        r = np.mean(np.mean(ind_mask <= k, axis=1))
+        r_t = np.mean(np.mean(ind_mask_t <= k, axis=1))
+        rk_v2t['hit_ratio_' + str(k)] = r
+        rk_t2v['hit_ratio_' + str(k)] = r_t
+
+        r_t = np.mean(ind_mask_t.min(axis=1) <= k)
+        r = np.mean(ind_mask.min(axis=1) <= k)
+        rk_v2t['best_' + str(k)] = r
+        rk_t2v['best_' + str(k)] = r_t
+
+        r_t = np.mean(ind_mask_t.max(axis=1) <= k)
+        r = np.mean(ind_mask.max(axis=1) <= k)
+        rk_v2t['worst_' + str(k)] = r
+        rk_t2v['worst_' + str(k)] = r_t
+
+    return rk_t2v, rk_v2t
 
 def print_computed_metrics(metrics):
     r1 = metrics['R1']

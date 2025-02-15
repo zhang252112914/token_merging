@@ -14,7 +14,7 @@ from .module_clip import CLIP, convert_weights, _PT_NAME
 from .module_cross import Transformer as TransformerClip
 from .module_tome_patch import apply_patch as tome_patch
 from .module_tome_utils import parse_r
-from .until_module import LayerNorm, AllGather, AllGather2, CrossEn, MSE, ArcCrossEn, KL
+from .until_module import LayerNorm, AllGather, AllGather2, CrossEn, CrossEnMulti, MSE, ArcCrossEn, KL
 import numpy as np
 import copy
 allgather = AllGather.apply
@@ -82,7 +82,7 @@ class VTRModel(nn.Module):
                          context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, self.lora_dim, 
                         self.merge_layer, config.frame_pos, frame_num_list)
             
-        self.loss_fct = CrossEn(config)
+        self.loss_fct = CrossEnMulti(config)
 
         self.clip.load_state_dict(state_dict, strict=False)
 
@@ -140,11 +140,12 @@ class VTRModel(nn.Module):
             
         tome_patch(self.clip, trace_source=self.tome_tracesource, prop_attn=self.tome_propattn)
         
-    def forward(self, text_ids, text_mask, video, video_mask=None, idx=None, global_step=0):
-        text_ids = text_ids.view(-1, text_ids.shape[-1])
-        text_mask = text_mask.view(-1, text_mask.shape[-1])
+    def forward(self, text_ids, text_mask, video, video_mask=None, group_mask=None, idx=None, global_step=0):
+        #text_ids = text_ids.view(-1, text_ids.shape[-1])
+        #text_mask = text_mask.view(-1, text_mask.shape[-1])
         video_mask = video_mask.view(-1, video_mask.shape[-1])
         video = torch.as_tensor(video).float()
+
         if len(video.size()) == 5:
             b, n_v, d, h, w = video.shape
             video = video.view(b * n_v, d, h, w)
@@ -152,30 +153,53 @@ class VTRModel(nn.Module):
             b, pair, bs, ts, channel, h, w = video.shape
             video = video.view(b * pair * bs * ts, channel, h, w)
 
-        cls = self.get_text_feat(text_ids, text_mask)
+        cls = self.get_text_feat(text_ids, text_mask, group_mask) # cls contains nan
         video_feat = self.get_video_feat(video, video_mask)
-        
-        cls = allgather(cls, self.config)
-        video_feat = allgather(video_feat, self.config)
-        torch.distributed.barrier()
-        
+        #assert not torch.any(torch.isnan(cls)), "cls contains NaN!"
+
         logit_scale = self.clip.logit_scale.exp()
         loss = 0.
         
-        t_feat = cls / cls.norm(dim=-1, keepdim=True)
-        v_feat = video_feat / video_feat.norm(dim=-1, keepdim=True)
+        #t_feat = cls / cls.norm(dim=-1, keepdim=True)
+        # t2v_logits = torch.einsum('td,vd->tv', [t_feat, v_feat])
+        t2v_logits, sim_mask = self.get_similarity_logits(cls, video_feat, group_mask, logit_scale)
+        # pass this point
 
-        t2v_logits = torch.einsum('td,vd->tv', [t_feat, v_feat])
-
-        loss_t2v = self.loss_fct(t2v_logits * logit_scale)
-        loss_v2t = self.loss_fct(t2v_logits.T * logit_scale)
+        loss_t2v = self.loss_fct(t2v_logits, sim_mask)
+        loss_v2t = self.loss_fct(t2v_logits.T, sim_mask.T)
         loss = (loss_t2v + loss_v2t) / 2
         
         return loss
+    
+    def get_similarity_logits(self, text_cls, video_feat, group_mask, logit_scale=None):
 
-    def stage1_eval(self, text_ids, text_mask, video, video_mask=None, idx=None, global_step=0):
-        text_ids = text_ids.view(-1, text_ids.shape[-1])
-        text_mask = text_mask.view(-1, text_mask.shape[-1])
+        text_cls = allgather(text_cls, self.config) # (batch_size, max_sentences, embed_dim)
+        video_feat = allgather(video_feat, self.config) #(batch_size, embed_dim)
+        group_mask = allgather(group_mask, self.config) #(batch_size, max_sentences)
+        torch.distributed.barrier()
+
+        video_feat = video_feat / (video_feat.norm(dim=-1, keepdim=True)+1e-6)
+        text_cls = text_cls / (text_cls.norm(dim=-1, keepdim=True)+1e-6)
+
+        sequences = []
+        sequence_mask = []
+        for i in range(len(text_cls)):
+            temp = text_cls[i][group_mask[i] == 1] # temp is valid sentences
+            temp = temp / (temp.norm(dim=-1, keepdim=True)+1e-6)
+            sequences.append(temp)
+            temp_mask = torch.zeros(len(temp), len(text_cls)).to(text_cls.device) # (valid_sentences, batch_size)
+            temp_mask[:, i] = 1
+            sequence_mask.append(temp_mask)
+        
+        sequences = torch.cat(sequences)
+        sequence_mask = torch.cat(sequence_mask)
+        retrieval_logits = logit_scale * torch.matmul(sequences, video_feat.t())
+        
+        return retrieval_logits, sequence_mask
+    
+    def stage1_eval(self, text_ids, text_mask, video, group_mask ,video_mask=None, idx=None, global_step=0):
+        #text_ids = text_ids.view(-1, text_ids.shape[-1])
+        #text_mask = text_mask.view(-1, text_mask.shape[-1])
         video_mask = video_mask.view(-1, video_mask.shape[-1])
         video = torch.as_tensor(video).float()
         if len(video.size()) == 5:
@@ -185,42 +209,57 @@ class VTRModel(nn.Module):
             b, pair, bs, ts, channel, h, w = video.shape
             video = video.view(b * pair * bs * ts, channel, h, w)
 
-        cls = self.get_text_feat(text_ids, text_mask)
+        cls = self.get_text_feat(text_ids, text_mask, group_mask)
         video = self.get_video_feat(video, video_mask)
 
         return cls, video
 
-    def stage2_eval(self, cls, text_mask, video_feat, video_mask):
+    def stage2_eval(self, cls, video_feat, group_mask=None):
         logit_scale = self.clip.logit_scale.exp()
         
-        t_feat = cls / cls.norm(dim=-1, keepdim=True) 
-        v_feat = video_feat / video_feat.norm(dim=-1, keepdim=True) 
+        # t_feat = cls / cls.norm(dim=-1, keepdim=True) 
+        # v_feat = video_feat / video_feat.norm(dim=-1, keepdim=True) 
 
-        t2v_logits = torch.einsum('td,vd->tv', [t_feat, v_feat])
+        # t2v_logits = torch.einsum('td,vd->tv', [t_feat, v_feat])
+        t2v_logits, sim_mask = self.get_similarity_logits(cls, video_feat, group_mask, logit_scale)
         
-        return t2v_logits * logit_scale
+        return t2v_logits, sim_mask
 
-    def get_text_feat(self, text_ids, orig_mask):
-        b = text_ids.size(0)
-        x = self.clip.token_embedding(text_ids) 
-        max_t_len = x.size(1)
+    def get_text_feat(self, text_ids, orig_mask, group_mask=None):
+        # adjust the input shape to reuse the original code
+        batch_size, max_sentences, max_words = text_ids.shape
+        text_ids = text_ids.view(-1, max_words)
+        orig_mask = orig_mask.view(-1, max_words)
+
+        #=== change 1: make sure every text has at least one "valid" token
+        invalid_text_mask = (orig_mask.sum(dim=-1) == 0)
+        orig_mask[invalid_text_mask, 0] = 1
+
+        x = self.clip.token_embedding(text_ids) # x = (batch_size*max_sentences, max_t_len, embed_dim)
+        max_t_len = x.size(1) 
         pos_emd = self.clip.positional_embedding[:max_t_len, :]
-        x = x + pos_emd
+        x = x + pos_emd # add positional embedding
 
-        mask = orig_mask
+        #=== change 2: apply safer mask(change -inf to large negative number)
+        mask = orig_mask # token mask
         text_length = max_t_len
-        attn_mask = self.clip.build_attention_mask(text_length).repeat(x.size(0), 1, 1).to(mask.device)
-        inf = torch.zeros((text_length, text_length)).fill_(float("-inf")).repeat(x.size(0), 1, 1).to(mask.device)
-        mask = mask.unsqueeze(1).expand(-1, mask.size(1), -1)
-        attn_mask = torch.where(mask>0, attn_mask, inf)
+        attn_mask = self.clip.build_attention_mask(text_length).repeat(x.size(0), 1, 1).to(mask.device) # assign attention_mask to every sample
+        inf_value = -1e8
+        #inf = torch.zeros((text_length, text_length)).fill_(inf_value).repeat(x.size(0), 1, 1).to(mask.device)
+        inf = torch.full_like(attn_mask, inf_value, dtype=attn_mask.dtype, device=x.device)
+        mask = mask.unsqueeze(1).expand(-1, mask.size(1), -1) # change the mask shape to (batch_size, max_t_len, max_t_len) to adapt to the attention mask
+        attn_mask = torch.where(mask>0, attn_mask, inf) # get the final attention mask(apply the mask to the attention mask)
     
         x = self.clip.transformer(x, attn_mask)
+        #assert not torch.any(torch.isnan(x)), "Input contains NaN!"
 
-        hidden = self.clip.ln_final(x) @ self.clip.text_projection
+        hidden = self.clip.ln_final(x) @ self.clip.text_projection # layer normalization and projection
         cls = hidden[torch.arange(hidden.shape[0]), text_ids.argmax(dim=-1)]
 
         cls = cls.float()
-        cls = cls.view(b, -1, cls.size(-1)).squeeze(1)
+        cls = cls.view(batch_size, max_sentences, -1)
+        if group_mask is not None:
+            cls = cls * group_mask.unsqueeze(-1).float()
         return cls
 
     def get_video_feat(self, video, video_mask):
@@ -276,7 +315,7 @@ class VTRModel(nn.Module):
         
         video_feat = video_feat.contiguous()
         
-        video_feat = video_feat / video_feat.norm(dim=-1, keepdim=True)
+        video_feat = video_feat / (video_feat.norm(dim=-1, keepdim=True)+1e-6)
         video_feat = self.get_video_avg_feat(video_feat, video_mask)
         
         return video_feat

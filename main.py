@@ -19,7 +19,7 @@ from tvr.dataloaders.data_dataloaders import DATALOADER_DICT
 from tvr.dataloaders.dataloader_msrvtt_retrieval import MSRVTTDataset
 from tvr.models.modeling import VTRModel, AllGather
 from tvr.models.optimization_adamw import AdamW, get_cosine_schedule_with_warmup
-from tvr.utils.metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
+from tvr.utils.metrics import compute_metrics, compute_metrics_together, tensor_text_to_video_metrics, tensor_video_to_text_sim
 
 from tvr.utils.comm import is_main_process, synchronize
 from tvr.utils.logger import setup_logger
@@ -273,16 +273,26 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
             # multi-gpu does scattering it-self
             batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
 
-        text_ids, text_mask, video, video_mask, inds, idx = batch
-        loss = model(text_ids, text_mask, video, video_mask, idx, global_step)  # this loss is about accuracy
+        text_ids, text_mask, video, video_mask, inds, idx, group_mask = batch
+        loss = model(text_ids, text_mask, video, video_mask, group_mask,idx, global_step)  # this loss is about accuracy
 
         optimizer.zero_grad()
         
         if n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu.
 
-        with torch.autograd.detect_anomaly():
-            loss.backward()
+        # loss is not nan
+        # with torch.autograd.detect_anomaly():
+        #     loss.backward()
+
+        loss.backward()
+        # for name, param in model.named_parameters():
+        #     if param.grad is not None and torch.isnan(param.grad).any():
+        #         print("nan gradient found")
+        #         print("name:",name)
+        #         print("param:",param.grad)
+        #         raise SystemExit
+
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # gradient clip
         
@@ -364,62 +374,80 @@ def eval_epoch(args, model, test_dataloader, device):
     batch_cls, batch_mask_t = [], []
     batch_video_feat, batch_mask_v = [], []
     batch_ids = []
+    batch_group_mask = []
 
     with torch.no_grad():
         tic = time.time()
 
         sim_matrix = []
 
+        # this section is the first stage (the author divide the evaluation into two stages)
+        # the first stage is feature extraction
         logger.info('[start] extract')
         for batch in tqdm(test_dataloader):
             batch = tuple(t.to(device) for t in batch)
-            text_ids, text_mask, video, video_mask, inds, _ = batch
-            cls, video_feat = model.stage1_eval(text_ids, text_mask, video, video_mask)
+            text_ids, text_mask, video, video_mask, inds, _, group_mask = batch
+            cls, video_feat = model.stage1_eval(text_ids, text_mask, video, group_mask, video_mask)
             batch_cls.append(cls)
             batch_mask_t.append(text_mask)
             batch_video_feat.append(video_feat)
             batch_mask_v.append(video_mask)
             batch_ids.append(inds)
+            batch_group_mask.append(group_mask)
 
         torch.distributed.barrier()
         
         batch_ids = allgather(torch.cat(batch_ids, dim=0), args).squeeze()
-        
+        # sort the tensor
         batch_cls = allgather(torch.cat(batch_cls, dim=0), args)
         batch_mask_t = allgather(torch.cat(batch_mask_t, dim=0), args)
         batch_video_feat = allgather(torch.cat(batch_video_feat, dim=0), args)
         batch_mask_v = allgather(torch.cat(batch_mask_v, dim=0), args)
+        batch_group_mask = allgather(torch.cat(batch_group_mask, dim=0), args)
         
         batch_cls[batch_ids] = batch_cls.clone()
         batch_mask_t[batch_ids] = batch_mask_t.clone()
         batch_video_feat[batch_ids] = batch_video_feat.clone()
         batch_mask_v[batch_ids] = batch_mask_v.clone()
+        batch_group_mask[batch_ids] = batch_group_mask.clone()
         
+        # retain the valid data
         batch_cls = batch_cls[:batch_ids.max() + 1, ...]
         batch_mask_t = batch_mask_t[:batch_ids.max() + 1, ...]
         batch_video_feat = batch_video_feat[:batch_ids.max() + 1, ...]
         batch_mask_v = batch_mask_v[:batch_ids.max() + 1, ...]
+        batch_group_mask = batch_group_mask[:batch_ids.max() + 1, ...]
         logger.info('[finish] extract')
         
         logger.info('[start] calculate the similarity')
         with torch.no_grad():
             mini_batch = args.batch_size_val
             sim_matrix = []
+            masks = []
             
             batch_cls_split = torch.split(batch_cls, mini_batch)
             batch_mask_t_split = torch.split(batch_mask_t, mini_batch)
             batch_video_feat_split = torch.split(batch_video_feat, mini_batch)
             batch_mask_v_split = torch.split(batch_mask_v, mini_batch)
+            batch_group_mask_split = torch.split(batch_group_mask, mini_batch)
             
-            for cls, text_mask in tqdm(zip(batch_cls_split, batch_mask_t_split)):
+            for text_idx, (cls, text_mask, group_mask) in enumerate(tqdm(zip(batch_cls_split, batch_mask_t_split, batch_group_mask_split))):
                 each_row = []
-                for video_feat, video_mask in zip(batch_video_feat_split, batch_mask_v_split):
-                    logits = model.stage2_eval(cls, text_mask, video_feat, video_mask)
+                sim_masks = []
+                for video_idx, (video_feat, video_mask) in enumerate(zip(batch_video_feat_split, batch_mask_v_split)):
+                    logits, sim_mask = model.stage2_eval(cls, video_feat, group_mask) # because the unbalanced number, so we need to check the mask. If needed, it should be set to zero
+                    if video_idx != text_idx:
+                        sim_mask = torch.zeros_like(logits) # because the dismatch between groups and the number of sample in groups is diffrenet 
                     logits = logits.cpu().detach().numpy()
+                    sim_mask = sim_mask.cpu().detach().numpy()
                     each_row.append(logits)
+                    sim_masks.append(sim_mask)
                 each_row = np.concatenate(tuple(each_row), axis=-1)
+                sim_masks = np.concatenate(tuple(sim_masks), axis=-1)
                 sim_matrix.append(each_row)
+                masks.append(sim_masks)
             sim_matrix = np.concatenate(tuple(sim_matrix), axis=0)
+            masks = np.concatenate(tuple(masks), axis=0)
         logger.info('[finish] calculate the similarity')
         
         
@@ -428,16 +456,21 @@ def eval_epoch(args, model, test_dataloader, device):
     global sim_name_list
     
     max_R1=[]
-    list_idx = 0
-    tv_metrics = compute_metrics(sim_matrix)
-    vt_metrics = compute_metrics(sim_matrix.T)
-    logger.info("Eval {} ...".format(sim_name_list[list_idx]))
-    logger.info("Text-to-Video: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@50: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}".
-                format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['R50'], tv_metrics['MR'], tv_metrics['MeanR']))
-    logger.info("Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@50: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}".
-                format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['R50'], vt_metrics['MR'], vt_metrics['MeanR']))
-    max_R1.append(tv_metrics['R1'])
-
+    # list_idx = 0
+    # tv_metrics = compute_metrics(sim_matrix)
+    # vt_metrics = compute_metrics(sim_matrix.T)
+    tv_metrics, vt_metrics = compute_metrics_together(sim_matrix.T, masks.T)
+    # logger.info("Eval {} ...".format(sim_name_list[list_idx]))
+    # logger.info("Text-to-Video: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@50: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}".
+    #             format(tv_metrics['R1'], tv_metrics['R5'], tv_metrics['R10'], tv_metrics['R50'], tv_metrics['MR'], tv_metrics['MeanR']))
+    # logger.info("Video-to-Text: R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - R@50: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}".
+    #             format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['R50'], vt_metrics['MR'], vt_metrics['MeanR']))
+    for key in tv_metrics:
+        logger.info("{}: {}".format(key, tv_metrics[key]))
+    logger.info("Video to text:")
+    for key in vt_metrics:
+        logger.info("{}: {}".format(key, vt_metrics[key]))
+    max_R1.append(tv_metrics['hit_ratio_1'])
     return max_R1
 
 def main():

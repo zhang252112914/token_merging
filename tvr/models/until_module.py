@@ -284,3 +284,14 @@ class AllGather2(torch.autograd.Function):
         grad_input = grad_output.clone()
         torch.distributed.all_reduce(grad_input, op=torch.distributed.ReduceOp.SUM, async_op=False)
         return (grad_input[ctx.rank * ctx.batch_size:(ctx.rank + 1) * ctx.batch_size], None)
+
+class CrossEnMulti(nn.Module):
+    def __init__(self, config=None):
+        super(CrossEnMulti, self).__init__()
+
+    def forward(self, sim_matrix, sim_mask):
+        logpt = F.log_softmax(sim_matrix, dim=0)
+        sim_mask = sim_mask / (torch.sum(sim_mask, dim=0) + 1e-6)
+        logpt = -torch.sum(logpt*sim_mask, dim=0)
+        loss = logpt.mean()
+        return loss
